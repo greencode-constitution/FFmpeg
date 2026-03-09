@@ -311,6 +311,8 @@ static av_cold int init(AVFilterContext *ctx)
 
 #if ARCH_X86
     ff_noise_init_x86(n);
+#elif ARCH_AARCH64 && HAVE_NEON
+    ff_noise_init_aarch64(n);
 #endif
 
     return 0;

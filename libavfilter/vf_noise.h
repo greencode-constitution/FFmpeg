@@ -64,5 +64,6 @@ void ff_line_noise_c(uint8_t *dst, const uint8_t *src, const int8_t *noise, int 
 void ff_line_noise_avg_c(uint8_t *dst, const uint8_t *src, int len, const int8_t * const *shift);
 
 void ff_noise_init_x86(NoiseContext *n);
+void ff_noise_init_aarch64(NoiseContext *n);
 
 #endif /* AVFILTER_NOISE_H */
