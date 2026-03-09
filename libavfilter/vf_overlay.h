@@ -83,5 +83,6 @@ typedef struct OverlayContext {
 } OverlayContext;
 
 void ff_overlay_init_x86(AVFilterContext *ctx);
+void ff_overlay_init_aarch64(AVFilterContext *ctx);
 
 #endif /* AVFILTER_OVERLAY_H */

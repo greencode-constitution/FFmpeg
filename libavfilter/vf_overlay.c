@@ -837,6 +837,8 @@ static int init_slice_fn(AVFilterContext *ctx)
 
 #if ARCH_X86 && HAVE_X86ASM
     ff_overlay_init_x86(ctx);
+#elif ARCH_AARCH64 && HAVE_NEON
+    ff_overlay_init_aarch64(ctx);
 #endif
 
     return 0;
