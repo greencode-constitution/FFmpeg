@@ -172,6 +172,155 @@ static int name##_##nbits(AVFilterContext *ctx, void *arg, int jobnr, int nb_job
 DEF_UNSHARP_SLICE_FUNC(unsharp_slice, 16)
 DEF_UNSHARP_SLICE_FUNC(unsharp_slice, 8)
 
+/**
+ * Specialized 5x5 8-bit unsharp mask (steps_x=2, steps_y=2).
+ *
+ * The generic version uses inner loops of length steps_x*2 and steps_y*2
+ * to propagate the FSM state.  For the 5x5 case those loops are only 4
+ * iterations each, but the compiler cannot fully unroll them because the
+ * trip counts come from runtime variables.  This version hard-codes the
+ * trip count, keeps sr[] in local variables (guaranteed registers), and
+ * caches sc[] row pointers to remove a level of indirection.
+ *
+ * The x-loop is split into three regions (left edge, middle, right edge)
+ * so that the hot middle section carries no boundary checks.
+ *
+ * Constitutional principle: R2 (avoid invariant computation in loops) and
+ * H2 (avoid object/indirection overhead in tight loops).
+ */
+static int unsharp_slice_8_5x5(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
+{
+    ThreadData *td = arg;
+    UnsharpFilterParam *fp = td->fp;
+    uint32_t **sc = fp->sc;
+    const int amount = fp->amount;
+    const int scalebits = fp->scalebits;  /* 8 for 5x5 */
+    const int32_t halfscale = fp->halfscale;
+
+    const uint8_t *src = td->src;
+    uint8_t *dst = td->dst;
+    int dst_stride = td->dst_stride;
+    int src_stride = td->src_stride;
+    const int width = td->width;
+    const int height = td->height;
+    const int sc_offset = jobnr * 4;      /* 2 * steps_y = 4 */
+    const int slice_start = (height * jobnr) / nb_jobs;
+    const int slice_end = (height * (jobnr + 1)) / nb_jobs;
+
+    /* Cache sc row pointers to avoid double indirection in the hot loop */
+    uint32_t *sc0 = sc[sc_offset + 0];
+    uint32_t *sc1 = sc[sc_offset + 1];
+    uint32_t *sc2 = sc[sc_offset + 2];
+    uint32_t *sc3 = sc[sc_offset + 3];
+
+    const uint8_t *src2 = NULL;
+    int x, y;
+
+    if (!amount) {
+        av_image_copy_plane(td->dst + slice_start * dst_stride, dst_stride,
+                            td->src + slice_start * src_stride, src_stride,
+                            width, slice_end - slice_start);
+        return 0;
+    }
+
+    memset(sc0, 0, sizeof(sc0[0]) * (width + 4));
+    memset(sc1, 0, sizeof(sc1[0]) * (width + 4));
+    memset(sc2, 0, sizeof(sc2[0]) * (width + 4));
+    memset(sc3, 0, sizeof(sc3[0]) * (width + 4));
+
+    if (slice_start > 2) {
+        src += (slice_start - 2) * src_stride;
+        dst += (slice_start - 2) * dst_stride;
+    }
+
+    for (y = -2 + slice_start; y < 2 + slice_end; y++) {
+        if (y < height)
+            src2 = src;
+
+        /* sr[] local variables — guaranteed register allocation */
+        uint32_t sr0 = 0, sr1 = 0, sr2 = 0, sr3 = 0;
+
+        /* Left edge: x = -2, -1, 0  (3 pixels, all clamp to src2[0]) */
+        {
+            uint32_t tmp1, tmp2;
+            for (x = -2; x <= 0; x++) {
+                tmp1 = src2[0];
+                /* Unrolled horizontal FSM (steps_x=2, 4 iterations) */
+                tmp2 = sr0 + tmp1; sr0 = tmp1;
+                tmp1 = sr1 + tmp2; sr1 = tmp2;
+                tmp2 = sr2 + tmp1; sr2 = tmp1;
+                tmp1 = sr3 + tmp2; sr3 = tmp2;
+                /* Unrolled vertical FSM (steps_y=2, 4 iterations) */
+                tmp2 = sc0[x + 2] + tmp1; sc0[x + 2] = tmp1;
+                tmp1 = sc1[x + 2] + tmp2; sc1[x + 2] = tmp2;
+                tmp2 = sc2[x + 2] + tmp1; sc2[x + 2] = tmp1;
+                tmp1 = sc3[x + 2] + tmp2; sc3[x + 2] = tmp2;
+            }
+        }
+
+        /* Middle: x = 1 .. width-2  (hot path, no boundary checks) */
+        if (y >= (2 + slice_start)) {
+            uint32_t tmp1, tmp2;
+            for (x = 1; x < width - 1; x++) {
+                tmp1 = src2[x];
+                tmp2 = sr0 + tmp1; sr0 = tmp1;
+                tmp1 = sr1 + tmp2; sr1 = tmp2;
+                tmp2 = sr2 + tmp1; sr2 = tmp1;
+                tmp1 = sr3 + tmp2; sr3 = tmp2;
+                tmp2 = sc0[x + 2] + tmp1; sc0[x + 2] = tmp1;
+                tmp1 = sc1[x + 2] + tmp2; sc1[x + 2] = tmp2;
+                tmp2 = sc2[x + 2] + tmp1; sc2[x + 2] = tmp1;
+                tmp1 = sc3[x + 2] + tmp2; sc3[x + 2] = tmp2;
+                {
+                    const uint8_t *srx = src - 2 * src_stride + x - 2;
+                    uint8_t *dsx = dst - 2 * dst_stride + x - 2;
+                    int32_t res = (int32_t)*srx + ((((int32_t)*srx -
+                                  (int32_t)((tmp1 + halfscale) >> scalebits)) * amount) >> 16);
+                    *dsx = av_clip_uint8(res);
+                }
+            }
+            /* Right edge with output: x = width-1 .. width+1 */
+            for (x = FFMAX(width - 1, 1); x < width + 2; x++) {
+                tmp1 = (x < width) ? src2[x] : src2[width - 1];
+                tmp2 = sr0 + tmp1; sr0 = tmp1;
+                tmp1 = sr1 + tmp2; sr1 = tmp2;
+                tmp2 = sr2 + tmp1; sr2 = tmp1;
+                tmp1 = sr3 + tmp2; sr3 = tmp2;
+                tmp2 = sc0[x + 2] + tmp1; sc0[x + 2] = tmp1;
+                tmp1 = sc1[x + 2] + tmp2; sc1[x + 2] = tmp2;
+                tmp2 = sc2[x + 2] + tmp1; sc2[x + 2] = tmp1;
+                tmp1 = sc3[x + 2] + tmp2; sc3[x + 2] = tmp2;
+                if (x >= 2) {
+                    const uint8_t *srx = src - 2 * src_stride + x - 2;
+                    uint8_t *dsx = dst - 2 * dst_stride + x - 2;
+                    int32_t res = (int32_t)*srx + ((((int32_t)*srx -
+                                  (int32_t)((tmp1 + halfscale) >> scalebits)) * amount) >> 16);
+                    *dsx = av_clip_uint8(res);
+                }
+            }
+        } else {
+            /* No output row yet — just propagate FSM state */
+            uint32_t tmp1, tmp2;
+            for (x = 1; x < width + 2; x++) {
+                tmp1 = (x < width) ? src2[x] : src2[width - 1];
+                tmp2 = sr0 + tmp1; sr0 = tmp1;
+                tmp1 = sr1 + tmp2; sr1 = tmp2;
+                tmp2 = sr2 + tmp1; sr2 = tmp1;
+                tmp1 = sr3 + tmp2; sr3 = tmp2;
+                tmp2 = sc0[x + 2] + tmp1; sc0[x + 2] = tmp1;
+                tmp1 = sc1[x + 2] + tmp2; sc1[x + 2] = tmp2;
+                tmp2 = sc2[x + 2] + tmp1; sc2[x + 2] = tmp1;
+                tmp1 = sc3[x + 2] + tmp2; sc3[x + 2] = tmp2;
+            }
+        }
+        if (y >= 0) {
+            dst += dst_stride;
+            src += src_stride;
+        }
+    }
+    return 0;
+}
+
 static int apply_unsharp(AVFilterContext *ctx, AVFrame *in, AVFrame *out)
 {
     AVFilterLink *inlink = ctx->inputs[0];
@@ -296,7 +445,13 @@ static int config_input(AVFilterLink *inlink)
     s->vsub = desc->log2_chroma_h;
     s->bitdepth = desc->comp[0].depth;
     s->bps = s->bitdepth > 8 ? 2 : 1;
-    s->unsharp_slice = s->bitdepth > 8 ? unsharp_slice_16 : unsharp_slice_8;
+    if (s->bitdepth > 8)
+        s->unsharp_slice = unsharp_slice_16;
+    else if (s->luma.steps_x == 2 && s->luma.steps_y == 2 &&
+             s->chroma.steps_x == 2 && s->chroma.steps_y == 2)
+        s->unsharp_slice = unsharp_slice_8_5x5;
+    else
+        s->unsharp_slice = unsharp_slice_8;
 
     // ensure (height / nb_threads) > 4 * steps_y,
     // so that we don't have too much overlap between two threads
